@@ -35,6 +35,7 @@ import {
   type QueueOwnerActiveSessionController,
 } from "./queue-owner-turn-controller.js";
 import { normalizeRuntimeSessionId } from "./runtime-session-id.js";
+import { setDesiredModeId } from "./session-mode-preference.js";
 import { connectAndLoadSession } from "./session-runtime/connect-load.js";
 import { applyConversation, applyLifecycleSnapshotToRecord } from "./session-runtime/lifecycle.js";
 import {
@@ -838,6 +839,20 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       await owner.close();
     }
     await releaseQueueOwnerLease(lease);
+
+    // Auto-close the session when the queue owner shuts down and the agent
+    // has exited, preventing zombie session accumulation (#47).
+    try {
+      const record = await resolveSessionRecord(options.sessionId);
+      if (!record.closed && record.lastAgentExitAt) {
+        record.closed = true;
+        record.closedAt = isoNow();
+        await writeSessionRecord(record);
+      }
+    } catch {
+      // best effort — session may already be cleaned up
+    }
+
     if (options.verbose) {
       process.stderr.write(`[acpx] queue owner stopped for session ${options.sessionId}\n`);
     }
@@ -885,8 +900,11 @@ export async function setSessionMode(
     options.verbose,
   );
   if (submittedToOwner) {
+    const record = await resolveSessionRecord(options.sessionId);
+    setDesiredModeId(record, options.modeId);
+    await writeSessionRecord(record);
     return {
-      record: await resolveSessionRecord(options.sessionId),
+      record,
       resumed: false,
     };
   }
@@ -913,8 +931,13 @@ export async function setSessionConfigOption(
     options.verbose,
   );
   if (ownerResponse) {
+    const record = await resolveSessionRecord(options.sessionId);
+    if (options.configId === "mode") {
+      setDesiredModeId(record, options.value);
+      await writeSessionRecord(record);
+    }
     return {
-      record: await resolveSessionRecord(options.sessionId),
+      record,
       response: ownerResponse,
       resumed: false,
     };

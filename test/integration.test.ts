@@ -70,6 +70,67 @@ test("integration: timeout emits structured TIMEOUT json error", async () => {
   });
 });
 
+test("integration: gemini ACP startup timeout is surfaced as actionable error", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-gemini-"));
+    const fakeGeminiPath = path.join(fakeBinDir, "gemini");
+    const previousTimeout = process.env.ACPX_GEMINI_ACP_STARTUP_TIMEOUT_MS;
+
+    try {
+      await fs.writeFile(fakeGeminiPath, "#!/bin/sh\nsleep 60\n", {
+        encoding: "utf8",
+        mode: 0o755,
+      });
+      process.env.ACPX_GEMINI_ACP_STARTUP_TIMEOUT_MS = "100";
+
+      const result = await runCli(
+        [
+          "--agent",
+          `${JSON.stringify(fakeGeminiPath)} --experimental-acp`,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "exec",
+          "say exactly: hi",
+        ],
+        homeDir,
+        { timeoutMs: 10_000 },
+      );
+
+      assert.equal(result.code, 3, result.stderr);
+      const payloads = result.stdout
+        .trim()
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              error?: { message?: string; data?: { acpxCode?: string; detailCode?: string } };
+            },
+        );
+      const timeoutError = payloads.find(
+        (payload) => payload.error?.data?.detailCode === "GEMINI_ACP_STARTUP_TIMEOUT",
+      );
+      assert(timeoutError, result.stdout);
+      assert.equal(timeoutError.error?.data?.acpxCode, "TIMEOUT");
+      assert.equal(timeoutError.error?.data?.detailCode, "GEMINI_ACP_STARTUP_TIMEOUT");
+      assert.match(timeoutError.error?.message ?? "", /Gemini CLI ACP startup timed out/i);
+      assert.match(timeoutError.error?.message ?? "", /API-key-based auth/i);
+    } finally {
+      if (previousTimeout == null) {
+        delete process.env.ACPX_GEMINI_ACP_STARTUP_TIMEOUT_MS;
+      } else {
+        process.env.ACPX_GEMINI_ACP_STARTUP_TIMEOUT_MS = previousTimeout;
+      }
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: non-interactive fail emits structured permission error", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -705,6 +766,93 @@ test("integration: prompt exits after done while detached owner stays warm", asy
 
       assert.equal(await waitForPidExit(lock.pid, 5_000), true);
     } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: session auto-closes when queue owner exits and agent has exited (#47)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      // 1. Create a persistent session
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const createdPayload = JSON.parse(created.stdout.trim()) as {
+        acpxRecordId?: string;
+      };
+      const sessionId = createdPayload.acpxRecordId;
+      assert.equal(typeof sessionId, "string");
+
+      // 2. Send a prompt with a very short TTL so the queue owner exits quickly
+      const prompt = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "--ttl", "1", "prompt", "echo oneshot-done"],
+        homeDir,
+      );
+      assert.equal(prompt.code, 0, prompt.stderr);
+      assert.match(prompt.stdout, /oneshot-done/);
+
+      // 3. Wait for the queue owner to exit (it should exit after 1s TTL)
+      const { lockPath } = queuePaths(homeDir, sessionId as string);
+      let ownerPid: number | undefined;
+      try {
+        const lockPayload = JSON.parse(await fs.readFile(lockPath, "utf8")) as {
+          pid?: number;
+        };
+        ownerPid = lockPayload.pid;
+      } catch {
+        // lock file may already be gone
+      }
+
+      if (typeof ownerPid === "number") {
+        assert.equal(await waitForPidExit(ownerPid, 10_000), true, "queue owner did not exit");
+      }
+
+      // Give a moment for final writes
+      await sleep(500);
+
+      // 4. Read the session record from disk
+      const recordPath = path.join(
+        homeDir,
+        ".acpx",
+        "sessions",
+        `${encodeURIComponent(sessionId as string)}.json`,
+      );
+      const storedRecord = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
+        closed?: boolean;
+        closed_at?: string;
+        last_agent_exit_at?: string;
+        last_agent_exit_code?: number | null;
+      };
+
+      // 5. After the fix for #47, the queue owner auto-closes the session
+      //    when it shuts down and the agent has exited.
+      assert.equal(
+        storedRecord.last_agent_exit_at != null,
+        true,
+        "expected last_agent_exit_at to be set (agent has exited)",
+      );
+
+      assert.equal(
+        storedRecord.closed,
+        true,
+        "session should be auto-closed after agent exit and queue owner shutdown (#47)",
+      );
+
+      assert.equal(
+        typeof storedRecord.closed_at,
+        "string",
+        "closed_at should be set when session is auto-closed",
+      );
+    } finally {
+      // Clean up: close session if it's still around
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
       await fs.rm(cwd, { recursive: true, force: true });
     }
   });
